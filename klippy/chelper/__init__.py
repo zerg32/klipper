@@ -12,10 +12,10 @@ import cffi
 ######################################################################
 
 GCC_CMD = "gcc"
-COMPILE_ARGS = ("-Wall -g -O2 -shared -fPIC"
+COMPILE_ARGS = ("-Wall -g -O2 -shared -fPIC -fomit-frame-pointer -fno-strict-aliasing -march=mips32r2 -mtune=mips32r2 -mhard-float"
                 " -flto -fwhole-program -fno-use-linker-plugin"
                 " -o %s %s")
-SSE_FLAGS = "-mfpmath=sse -msse2"
+SSE_FLAGS = ""
 SOURCE_FILES = [
     'pyhelper.c', 'serialqueue.c', 'stepcompress.c', 'steppersync.c',
     'itersolve.c', 'trapq.c', 'pollreactor.c', 'msgblock.c', 'trdispatch.c',
