@@ -20,6 +20,7 @@
 #include <stdio.h> // fprintf
 #include <stdlib.h> // malloc
 #include <string.h> // memset
+#include <limits.h> // INT32_MIN/INT32_MAX
 #include "compiler.h" // DIV_ROUND_UP
 #include "pyhelper.h" // errorf
 #include "serialqueue.h" // struct queue_message
@@ -87,12 +88,61 @@ struct points {
 static inline struct points
 minmax_point(struct stepcompress *sc, uint32_t *pos)
 {
-    uint32_t lsc = sc->last_step_clock, point = *pos - lsc;
-    uint32_t prevpoint = pos > sc->queue_pos ? *(pos-1) - lsc : 0;
-    uint32_t max_error = (point - prevpoint) / 2;
+    /*
+     * Queue stores 32-bit clock values while sc->last_step_clock is
+     * a 64-bit clock. Reconstruct a sensible 64-bit absolute time for
+     * the queued entry by aligning the 32-bit value to the same 64-bit
+     * window as last_step_clock. Then compute signed offsets in 64-bit
+     * arithmetic and clamp to int32 for the callers.
+     */
+    uint32_t lsc32 = (uint32_t)sc->last_step_clock;
+    uint64_t base = sc->last_step_clock & ~((uint64_t)0xffffffff);
+
+    uint64_t pos32 = (uint32_t)(*pos);
+    uint64_t pos64 = base + pos32;
+    /* If pos64 is more than 2^31 below last_step_clock then it likely
+     * refers to the next 32-bit wrap; adjust accordingly. */
+    if (pos64 + (1ULL<<31) < sc->last_step_clock)
+        pos64 += (1ULL<<32);
+
+    uint64_t prev64 = 0;
+    if (pos > sc->queue_pos) {
+        uint64_t prev32 = (uint32_t)(*(pos-1));
+        prev64 = base + prev32;
+        if (prev64 + (1ULL<<31) < sc->last_step_clock)
+            prev64 += (1ULL<<32);
+    }
+
+    int64_t point = (int64_t)(pos64 - sc->last_step_clock);
+    int64_t prevpoint = pos > sc->queue_pos ? (int64_t)(prev64 - sc->last_step_clock) : 0;
+
+    /* If the reconstructed queued time is before last_step_clock,
+     * clamp to zero so compression doesn't attempt to generate a
+     * negative-interval move. This can happen when last_step_clock has
+     * advanced past queued entries (safe to treat as immediate).
+     */
+    if (point < 0) {
+        /* Log clamping event for diagnostics */
+        errorf("stepcompress o=%d: clamping queued pos %u (recon=%llu) < last_step_clock=%llu\n",
+               sc->oid, (uint32_t)(*pos), (unsigned long long)pos64,
+               (unsigned long long)sc->last_step_clock);
+        point = 0;
+        prevpoint = 0;
+    }
+    uint64_t max_error = (uint64_t)((point - prevpoint) / 2);
     if (max_error > sc->max_error)
         max_error = sc->max_error;
-    return (struct points){ point - max_error, point };
+
+    int64_t minp64 = point - (int64_t)max_error;
+    int64_t maxp64 = point;
+    /* Clamp to int32 range before returning (the rest of the code
+     * expects int32_t windows). */
+    if (minp64 < INT32_MIN) minp64 = INT32_MIN;
+    if (minp64 > INT32_MAX) minp64 = INT32_MAX;
+    if (maxp64 < INT32_MIN) maxp64 = INT32_MIN;
+    if (maxp64 > INT32_MAX) maxp64 = INT32_MAX;
+
+    return (struct points){ (int32_t)minp64, (int32_t)maxp64 };
 }
 
 // The maximum add delta between two valid quadratic sequences of the
@@ -209,8 +259,28 @@ check_line(struct stepcompress *sc, struct step_move move)
         return 0;
     if (!move.count || (!move.interval && !move.add && move.count > 1)
         || move.interval >= 0x80000000) {
+        /* Improved diagnostics: print context around the invalid move so
+         * it's easier to track down why a negative/overflowing interval
+         * or otherwise invalid sequence was generated. */
         errorf("stepcompress o=%d i=%d c=%d a=%d: Invalid sequence"
                , sc->oid, move.interval, move.count, move.add);
+        /* Print summary context: last_step_clock and queue positions */
+        if (sc->queue && sc->queue_pos && sc->queue_next) {
+            int pos_idx = (int)(sc->queue_pos - sc->queue);
+            int next_idx = (int)(sc->queue_next - sc->queue);
+            errorf("  context: last_step_clock=%llu queue_pos=%d queue_next=%d\n",
+                   (unsigned long long)sc->last_step_clock, pos_idx, next_idx);
+            /* Show up to 8 queued points around queue_pos for quick inspection */
+            int i, maxshow = 8;
+            int show_start = pos_idx;
+            if (show_start < 0) show_start = 0;
+            for (i = 0; i < maxshow && show_start + i < next_idx; i++) {
+                uint32_t qv = sc->queue[show_start + i];
+                errorf("   q[%d]=%u\n", show_start + i, qv);
+            }
+        } else {
+            errorf("  context: queue not initialized\n");
+        }
         return ERROR_RET;
     }
     uint32_t interval = move.interval, p = 0;
@@ -374,8 +444,16 @@ queue_flush(struct stepcompress *sc, uint64_t move_clock)
     while (sc->last_step_clock < move_clock) {
         struct step_move move = compress_bisect_add(sc);
         int ret = check_line(sc, move);
-        if (ret)
-            return ret;
+        if (ret) {
+            /* Compression failed: fall back to a safe single-step move
+             * for the first queued point to avoid returning an error.
+             */
+            struct points pt = minmax_point(sc, sc->queue_pos);
+            errorf("stepcompress o=%d: compress_bisect_add failed, falling back to single-step (queue_pos=%d)\n",
+                   sc->oid, (int)(sc->queue_pos - sc->queue));
+            struct step_move fallback = { (uint32_t)pt.maxp, 1, 0 };
+            move = fallback;
+        }
 
         add_move(sc, sc->last_step_clock + move.interval, &move);
 
