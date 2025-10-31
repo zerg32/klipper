@@ -36,6 +36,7 @@ class ApiClientHelper(object):
             if not res:
                 # This client no longer needs updates - unregister it
                 self.client_cbs.remove(client_cb)
+        return len(self.client_cbs) > 0
 
     # Add a client that gets data callbacks
     def add_client(self, client_cb):
@@ -381,10 +382,22 @@ class LoadCell:
         self.clients.add_mux_endpoint("load_cell/dump_force",
                                       "load_cell", self.name, header)
         # startup, when klippy is ready, start capturing data
-        printer.register_event_handler("klippy:ready", self._handle_ready)
+        # allow disabling auto-start for probe-only use cases
+        # Only check for auto_start if this is a standalone [load_cell] section
+        # not when created internally by [load_cell_probe]
+        config_name = config.get_name()
+        if config_name.startswith('load_cell_probe'):
+            # Created by load_cell_probe - don't auto-start
+            auto_start = False
+        else:
+            # Standalone load_cell - check config option
+            auto_start = config.getboolean('auto_start', default=True)
+        if auto_start:
+            printer.register_event_handler("klippy:ready", self._handle_ready)
 
     def _handle_do_ready(self, eventtime):
-        self.sensor.add_client(self._sensor_data_event)
+        # Start continuous monitoring with force tracking
+        # This uses add_client which will start the sensor automatically
         self.add_client(self._track_force)
         # announce calibration status on ready
         if self.is_calibrated():
@@ -407,11 +420,15 @@ class LoadCell:
             samples.append([row[0], self.counts_to_grams(row[1]), row[1],
                             self.tare_counts])
         msg = {'data': samples, 'errors': errors, 'overflows': overflows}
-        self.clients.send(msg)
-        return True
+        has_clients = self.clients.send(msg)
+        # Return False to stop sensor when no more clients
+        return has_clients
 
     # get internal events of force data
     def add_client(self, callback):
+        # Start sensor measurements when first client is added
+        if not self.clients.client_cbs:
+            self.sensor.add_client(self._sensor_data_event)
         self.clients.add_client(callback)
 
     def tare(self, tare_counts):
