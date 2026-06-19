@@ -1,5 +1,11 @@
 #!/bin/bash
+set -euo pipefail
 
-./_build.sh bed
-./_build.sh noz
-./_build.sh mcu
+targets=("bed" "noz" "mcu")
+
+for target in "${targets[@]}"; do
+    echo "Building $target..."
+    ./_build.sh "$target"
+done
+
+echo "All builds complete."

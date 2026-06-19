@@ -4,7 +4,7 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
-#include "autoconf.h" // CONFIG_FLASH_APPLICATION_ADDRESS
+#include "autoconf.h"
 
 OUTPUT_FORMAT("elf32-littlearm", "elf32-littlearm", "elf32-littlearm")
 OUTPUT_ARCH(arm)
@@ -28,6 +28,13 @@ SECTIONS
 #endif
         *(.text .text.*)
         *(.rodata .rodata*)
+        *(.ARM.extab*)
+    } > rom
+
+    .ARM.exidx : {
+        __exidx_start = .;
+        *(.ARM.exidx*)
+        __exidx_end = .;
     } > rom
 
     . = ALIGN(4);
@@ -69,12 +76,7 @@ SECTIONS
     } > ram
 
     /DISCARD/ : {
-        // The .init/.fini sections are used by __libc_init_array(), but
-        // that isn't needed so no need to include them in the binary.
         *(.init)
         *(.fini)
-        // Don't include exception tables
-        *(.ARM.extab)
-        *(.ARM.exidx)
     }
 }
