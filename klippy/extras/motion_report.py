@@ -151,7 +151,7 @@ class PrinterMotionReport:
         self.next_status_time = 0.
         gcode = self.printer.lookup_object('gcode')
         self.last_status = {
-            'live_position': gcode.Coord(0., 0., 0., 0.),
+            'live_position': gcode.Coord((0., 0., 0.)),
             'live_velocity': 0., 'live_extruder_velocity': 0.,
             'steppers': [], 'trapq': [],
         }
@@ -177,31 +177,27 @@ class PrinterMotionReport:
                 break
             etrapq = extruder.get_trapq()
             self.dtrapqs[ename] = DumpTrapQ(self.printer, ename, etrapq)
+        # Lookup manual_stepper trapqs
+        for msname, ms in self.printer.lookup_objects("manual_stepper"):
+            mstrapq = ms.get_trapq()
+            self.dtrapqs[msname] = DumpTrapQ(self.printer, msname, mstrapq)
         # Populate 'trapq' and 'steppers' in get_status result
         self.last_status['steppers'] = list(sorted(self.steppers.keys()))
         self.last_status['trapq'] = list(sorted(self.dtrapqs.keys()))
     # Shutdown handling
-    def _handle_analyze_shutdown(self, msg, details):
-        if msg != "MCU shutdown":
-            return
-        mcu = self.printer.lookup_object(details.get("mcu"), None)
-        if mcu is None or details.get("shutdown_clock") is None:
-            return
-        shutdown_clock = details["shutdown_clock"]
-        shutdown_time = mcu.clock_to_print_time(shutdown_clock)
-        clock_100ms = mcu.seconds_to_clock(0.100)
-        start_clock = max(0, shutdown_clock - clock_100ms)
-        end_clock = shutdown_clock + clock_100ms
+    def _dump_shutdown(self, dsteppers, shutdown_time, duration=0.100):
         # Log stepper queue_steps on mcu that started shutdown (if any)
-        for dstepper in self.steppers.values():
-            if dstepper.mcu_stepper.get_mcu() is not mcu:
-                continue
+        start_time = shutdown_time - duration
+        end_time = shutdown_time + duration
+        for dstepper in dsteppers:
+            mcu = dstepper.mcu_stepper.get_mcu()
+            start_clock = max(0, mcu.print_time_to_clock(start_time))
+            end_clock = mcu.print_time_to_clock(end_time)
             data, cdata = dstepper.get_step_queue(start_clock, end_clock)
             dstepper.log_steps(data)
         # Log trapqs around time of shutdown
         for dtrapq in self.dtrapqs.values():
-            data, cdata = dtrapq.extract_trapq(shutdown_time - .100,
-                                               shutdown_time + .100)
+            data, cdata = dtrapq.extract_trapq(start_time, end_time)
             dtrapq.log_trapq(data)
         # Log estimated toolhead position at time of shutdown
         dtrapq = self.dtrapqs.get('toolhead')
@@ -211,32 +207,58 @@ class PrinterMotionReport:
         if pos is not None:
             logging.info("Requested toolhead position at shutdown time %.6f: %s"
                          , shutdown_time, pos)
+    def _handle_analyze_shutdown(self, msg, details):
+        if msg == "MCU shutdown":
+            mcu = self.printer.lookup_object(details.get("mcu"), None)
+            shutdown_clock = details.get("shutdown_clock")
+            if mcu is None or shutdown_clock is None:
+                return
+            shutdown_time = mcu.clock_to_print_time(shutdown_clock)
+            dsteppers = [dstepper for dstepper in self.steppers.values()
+                         if dstepper.mcu_stepper.get_mcu() is mcu]
+            self._dump_shutdown(dsteppers, shutdown_time)
+            return
+        if msg == "Internal error in stepcompress":
+            logging.info('stepcompress error info: %s', details)
+            step_gen_time = details.get("step_gen_time")
+            if step_gen_time is None:
+                return
+            dsteppers = []
+            stepper = self.steppers.get(details.get("queue_name"))
+            if stepper is not None:
+                dsteppers = [stepper]
+            self._dump_shutdown(dsteppers, step_gen_time, 1.0)
     # Status reporting
     def get_status(self, eventtime):
         if eventtime < self.next_status_time or not self.dtrapqs:
             return self.last_status
         self.next_status_time = eventtime + STATUS_REFRESH_TIME
-        xyzpos = (0., 0., 0.)
-        epos = (0.,)
         xyzvelocity = evelocity = 0.
         # Calculate current requested toolhead position
+        toolhead = self.printer.lookup_object('toolhead')
+        extra_axes = toolhead.get_extra_axes()
+        live_pos = [0.] * len(extra_axes)
         mcu = self.printer.lookup_object('mcu')
         print_time = mcu.estimated_print_time(eventtime)
         pos, velocity = self.dtrapqs['toolhead'].get_trapq_position(print_time)
         if pos is not None:
-            xyzpos = pos[:3]
+            live_pos[:3] = pos[:3]
             xyzvelocity = velocity
-        # Calculate requested position of currently active extruder
-        toolhead = self.printer.lookup_object('toolhead')
-        ehandler = self.dtrapqs.get(toolhead.get_extruder().get_name())
-        if ehandler is not None:
-            pos, velocity = ehandler.get_trapq_position(print_time)
-            if pos is not None:
-                epos = (pos[0],)
-                evelocity = velocity
+        # Calculate requested position of extra axes
+        for ea_index, ea in enumerate(extra_axes):
+            if ea is None:
+                continue
+            eaname = ea.get_name()
+            ehandler = self.dtrapqs.get(eaname)
+            if ehandler is not None:
+                pos, velocity = ehandler.get_trapq_position(print_time)
+                if pos is not None:
+                    live_pos[ea_index] = pos[0]
+                    if ea_index == 3:
+                        evelocity = velocity
         # Report status
         self.last_status = dict(self.last_status)
-        self.last_status['live_position'] = toolhead.Coord(*(xyzpos + epos))
+        self.last_status['live_position'] = toolhead.Coord(live_pos)
         self.last_status['live_velocity'] = xyzvelocity
         self.last_status['live_extruder_velocity'] = evelocity
         return self.last_status

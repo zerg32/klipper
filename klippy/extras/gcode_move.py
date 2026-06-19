@@ -94,7 +94,7 @@ class GCodeMove:
     def _get_gcode_position(self):
         p = [lp - bp for lp, bp in zip(self.last_position, self.base_position)]
         p[3] /= self.extrude_factor
-        return p[:4]
+        return p
     def _get_gcode_speed(self):
         return self.speed / self.speed_factor
     def _get_gcode_speed_override(self):
@@ -107,9 +107,10 @@ class GCodeMove:
             'extrude_factor': self.extrude_factor,
             'absolute_coordinates': self.absolute_coord,
             'absolute_extrude': self.absolute_extrude,
-            'homing_origin': self.Coord(*self.homing_position[:4]),
-            'position': self.Coord(*self.last_position[:4]),
-            'gcode_position': self.Coord(*move_position),
+            'homing_origin': self.Coord(self.homing_position),
+            'position': self.Coord(self.last_position),
+            'gcode_position': self.Coord(move_position),
+            'axis_map': self.axis_map,
         }
     def reset_last_position(self):
         if self.is_printer_ready:
@@ -122,7 +123,8 @@ class GCodeMove:
             if ea is None:
                 continue
             gcode_id = ea.get_axis_gcode_id()
-            if gcode_id is None or gcode_id in axis_map or gcode_id in "FN":
+            if (gcode_id is None or len(gcode_id) != 1 or not gcode_id.isupper()
+                or gcode_id in axis_map or gcode_id in "FN"):
                 continue
             axis_map[gcode_id] = index
         self.axis_map = axis_map
@@ -189,7 +191,7 @@ class GCodeMove:
     def cmd_M114(self, gcmd):
         # Get Current Position
         p = self._get_gcode_position()
-        gcmd.respond_raw("X:%.3f Y:%.3f Z:%.3f E:%.3f" % tuple(p))
+        gcmd.respond_raw("X:%.3f Y:%.3f Z:%.3f E:%.3f" % tuple(p[:4]))
     def cmd_M220(self, gcmd):
         # Set speed factor override percentage
         value = gcmd.get_float('S', 100., above=0.) / (60. * 100.)
